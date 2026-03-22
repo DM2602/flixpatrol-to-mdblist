@@ -1,0 +1,52 @@
+{
+  "FlixPatrolTop10": [
+    {
+      "platform": "netflix",
+      "location": "world",
+      "fallback": false,
+      "limit": 10,
+      "type": "movies",
+      "name": "Netflix Top 10 Movies",
+      "normalizeName": true
+    },
+    {
+      "platform": "netflix",
+      "location": "world",
+      "fallback": false,
+      "limit": 10,
+      "type": "shows",
+      "name": "Netflix Top 10 Shows",
+      "normalizeName": true
+    },
+    {
+      "platform": "disney",
+      "location": "world",
+      "fallback": false,
+      "limit": 10,
+      "type": "both",
+      "name": "Disney Plus Top 10",
+      "normalizeName": true
+    },
+    {
+      "platform": "amazon-prime",
+      "location": "world",
+      "fallback": false,
+      "limit": 10,
+      "type": "both",
+      "name": "Amazon Prime Top 10",
+      "normalizeName": true
+    }
+  ],
+  "FlixPatrolPopular": [],
+  "MDBList": {
+    "apiKey": "YOUR_MDBLIST_API_KEY_HERE"
+  },
+  "Schedule": {
+    "cron": "0 6,18 * * *",
+    "runOnStart": true
+  },
+  "Cache": {
+    "enabled": true,
+    "ttl": 86400
+  }
+}

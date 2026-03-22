@@ -1,0 +1,38 @@
+services:
+  flixpatrol-mdblist:
+    build: .
+    container_name: flixpatrol-mdblist
+    restart: unless-stopped
+
+    # ── Config volume ──────────────────────────────────────────
+    # First run creates config/default.json – edit it, then restart.
+    volumes:
+      - ./config:/app/config
+
+    # ── Environment variables ──────────────────────────────────
+    # All optional – they override values in config/default.json.
+    environment:
+      # Your MDBList API key (get it at https://mdblist.com/preferences/)
+      # Can also be set inside config/default.json instead.
+      - MDBLIST_API_KEY=${MDBLIST_API_KEY:-}
+
+      # Cron schedule (5-field). Default: twice daily at 06:00 and 18:00.
+      # FlixPatrol updates once a day, so more often is wasteful.
+      # Examples:
+      #   "0 6 * * *"       → once daily at 06:00
+      #   "0 6,18 * * *"    → twice daily (default)
+      #   "0 */8 * * *"     → every 8 hours
+      #   "0 3 * * 1"       → every Monday at 03:00
+      - SCHEDULE=${SCHEDULE:-0 6,18 * * *}
+
+      # Log verbosity: DEBUG, INFO, WARNING, ERROR
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+      # Set to "true" to preview without writing to MDBList
+      - DRY_RUN=${DRY_RUN:-false}
+
+      # Set to "true" to run once and exit (for external cron / testing)
+      - RUN_ONCE=${RUN_ONCE:-false}
+
+      # Timezone for the scheduler (optional)
+      - TZ=${TZ:-Europe/Zurich}
