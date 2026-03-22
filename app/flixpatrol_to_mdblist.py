@@ -31,6 +31,7 @@ from scheduler import Scheduler
 
 FLIXPATROL_BASE = "https://flixpatrol.com"
 MDBLIST_API_BASE = "https://api.mdblist.com"
+MDBLIST_SEARCH_URL = "https://mdblist.com/api/"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -205,18 +206,16 @@ class FlixPatrolScraper:
             return []
 
         items = []
-        # FlixPatrol uses div#1 for movies and div#2 for shows (tab based)
-        target_id = "1" if media_type == "movies" else "2"
-        section = soup.find("div", id=target_id)
-        if not section:
-            # Try alternative selectors
-            for div in soup.select("div[role='tabpanel'], div.tabContent"):
-                div_id = (div.get("id") or "").lower()
-                if media_type == "movies" and any(k in div_id for k in ["movie", "1"]):
-                    section = div
-                    break
-                if media_type == "shows" and any(k in div_id for k in ["show", "tv", "2"]):
-                    section = div
+        # FlixPatrol renders movies and shows in separate div.card blocks,
+        # each preceded by a heading like "TOP Movies on …" / "TOP TV Shows on …"
+        target_keywords = ["movie"] if media_type == "movies" else ["show", "tv show"]
+        section = None
+        for card in soup.select("div.card"):
+            heading = card.find_previous(["h1", "h2", "h3", "h4", "h5"])
+            if heading:
+                heading_text = heading.get_text(strip=True).lower()
+                if any(kw in heading_text for kw in target_keywords):
+                    section = card
                     break
 
         search_root = section if section else soup
@@ -348,7 +347,7 @@ class MDBListClient:
         return r if isinstance(r, list) else []
 
     def create_list(self, name: str) -> Optional[dict]:
-        return self._req("POST", "/lists", json={"name": name})
+        return self._req("POST", "/lists/user/add", json={"name": name, "private": False})
 
     def get_list_items(self, list_id: int) -> Optional[dict]:
         return self._req("GET", f"/lists/{list_id}/items")
@@ -370,13 +369,26 @@ class MDBListClient:
         return self._req("POST", f"/lists/{list_id}/items/remove", json=payload)
 
     def search(self, query: str, media_type: str = "any") -> list[dict]:
-        params = {"s": query}
+        params = {"s": query, "apikey": self.api_key}
         if media_type in ("movie", "show"):
             params["m"] = media_type
-        r = self._req("GET", "/search", params=params)
-        if isinstance(r, dict) and "search" in r:
-            return r["search"]
-        return r if isinstance(r, list) else []
+        logger.debug(f"MDBLIST SEARCH {query}")
+        try:
+            r = self.session.get(MDBLIST_SEARCH_URL, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except requests.RequestException as e:
+            logger.error(f"MDBList search error: {e}")
+            return []
+        if isinstance(data, dict) and "search" in data:
+            return data["search"]
+        return data if isinstance(data, list) else []
+
+    def update_list(self, list_id: int, name: str, description: str, private: bool = False) -> bool:
+        r = self._req("PUT", f"/lists/{list_id}", json={
+            "name": name, "description": description, "private": private,
+        })
+        return bool(r and r.get("success"))
 
 
 # ---------------------------------------------------------------------------
@@ -430,10 +442,9 @@ class TitleMatcher:
 
     @staticmethod
     def _ids(item: dict) -> dict:
-        ids = item.get("ids", {})
         r = {"title": item.get("title", ""), "year": item.get("year")}
-        imdb = ids.get("imdbid") or ids.get("imdb") or item.get("imdb_id")
-        tmdb = ids.get("tmdbid") or ids.get("tmdb") or item.get("tmdb_id") or item.get("id")
+        imdb = item.get("imdbid") or item.get("imdb_id")
+        tmdb = item.get("tmdbid") or item.get("tmdb_id")
         if imdb:
             r["imdb_id"] = imdb
         if tmdb:
@@ -475,9 +486,18 @@ def make_popular_name(cfg: dict) -> str:
     return " ".join(parts).title().replace("-", " ")
 
 
+def update_list_description(mdb: MDBListClient, list_id: int, name: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    desc = f"Automatically updated by flixpatrol-to-mdblist. Last updated: {ts}"
+    if not DRY_RUN:
+        mdb.update_list(list_id, name, desc)
+        logger.info(f"  Updated description: {desc}")
+
+
 def find_or_create_list(mdb: MDBListClient, name: str, slug: str) -> Optional[int]:
     for lst in mdb.get_my_lists():
-        if lst.get("slug") == slug or lst.get("name", "").lower() == name.lower():
+        if (lst.get("slug") == slug or lst.get("name", "").lower() == name.lower()) \
+                and not lst.get("dynamic", False):
             logger.info(f"  List exists: '{lst.get('name')}' (id={lst['id']})")
             return lst["id"]
     if DRY_RUN:
@@ -512,8 +532,8 @@ def sync_items(mdb: MDBListClient, list_id: int, items: list[dict], name: str):
     # Clear existing items first
     existing = mdb.get_list_items(list_id)
     if existing:
-        om = [{"imdb_id": m["imdb_id"]} for m in existing.get("movies", []) if m.get("imdb_id")]
-        os_ = [{"imdb_id": s["imdb_id"]} for s in existing.get("shows", []) if s.get("imdb_id")]
+        om = [{"imdb": m["imdb_id"]} for m in existing.get("movies", []) if m.get("imdb_id")]
+        os_ = [{"imdb": s["imdb_id"]} for s in existing.get("shows", []) if s.get("imdb_id")]
         if om or os_:
             mdb.remove_items(list_id, om or None, os_ or None)
 
@@ -526,9 +546,9 @@ def sync_items(mdb: MDBListClient, list_id: int, items: list[dict], name: str):
 
 def _entry(item: dict) -> Optional[dict]:
     if "imdb_id" in item:
-        return {"imdb_id": item["imdb_id"]}
+        return {"imdb": item["imdb_id"]}
     if "tmdb_id" in item:
-        return {"tmdb_id": item["tmdb_id"]}
+        return {"tmdb": item["tmdb_id"]}
     return None
 
 
@@ -628,6 +648,7 @@ def run_sync(cfg: dict):
         lid = find_or_create_list(mdb, name, slug)
         if lid is not None:
             sync_items(mdb, lid, matched, name)
+            update_list_description(mdb, lid, name)
         elif DRY_RUN:
             sync_items(mdb, 0, matched, name)
 
@@ -652,6 +673,7 @@ def run_sync(cfg: dict):
         lid = find_or_create_list(mdb, name, slug)
         if lid is not None:
             sync_items(mdb, lid, matched, name)
+            update_list_description(mdb, lid, name)
         elif DRY_RUN:
             sync_items(mdb, 0, matched, name)
 
