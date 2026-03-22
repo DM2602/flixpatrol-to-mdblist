@@ -1,6 +1,6 @@
 services:
   flixpatrol-mdblist:
-    build: .
+    image: ghcr.io/dm2602/flixpatrol-to-mdblist:latest
     container_name: flixpatrol-mdblist
     restart: unless-stopped
 
