@@ -1,7 +1,7 @@
 # FlixPatrol → MDBList Sync
 
 Scrape today's top 10 from [FlixPatrol](https://flixpatrol.com) and sync them to [MDBList](https://mdblist.com) static lists.
-Runs as a long-lived Docker container with a **built-in smart scheduler** — no external cron needed.
+Runs as a Docker container with a **built-in scheduler** — no external cron needed.
 
 Inspired by [flixpatrol-top10-on-trakt](https://github.com/Navino16/flixpatrol-top10-on-trakt), but targeting MDBList instead of Trakt.
 
@@ -43,7 +43,7 @@ cd flixpatrol-to-mdblist
 cp .env.example .env
 ```
 
-Edit `.env` and set your **MDBList API key** (get it free at [mdblist.com/preferences](https://mdblist.com/preferences/)):
+Edit `.env` and set your **MDBList API key** (get it at [mdblist.com/preferences](https://mdblist.com/preferences/)):
 
 ```env
 MDBLIST_API_KEY=your_key_here
@@ -93,7 +93,7 @@ All variables are optional and override values in `config/default.json`.
 | `@daily` | Midnight |
 | `@hourly` | Every hour (not recommended) |
 
-> ⚠️ **Do NOT use** `* * * * *` — this hammers FlixPatrol and burns your MDBList API quota.
+> **Do NOT use** `* * * * *` — this hammers FlixPatrol and burns your MDBList API quota.
 
 ### Config File (`config/default.json`)
 
@@ -153,13 +153,13 @@ All variables are optional and override values in `config/default.json`.
 ## How It Works
 
 ```
-┌─────────────┐     scrape      ┌─────────────┐    search     ┌─────────────┐
-│  FlixPatrol  │ ──────────────► │   Matcher    │ ────────────► │   MDBList   │
-│  (HTML)      │   titles+year   │  (title →    │  IMDB/TMDB   │   (API)     │
-└─────────────┘                  │   IMDB ID)   │    IDs       └──────┬──────┘
+┌─────────────┐      scrape      ┌─────────────┐    search     ┌─────────────┐
+│  FlixPatrol │  ──────────────► │   Matcher   │ ────────────► │   MDBList   │
+│  (HTML)     │    titles+year   │  (title →   │   IMDB/TMDB   │   (API)     │
+└─────────────┘                  │   IMDB ID)  │      IDs      └──────┬──────┘
                                  └─────────────┘                      │
-                                                              create/sync
-                                                              static lists
+                                                                 create/sync
+                                                                 static lists
 ```
 
 1. **Scrape** FlixPatrol top-10 / popular pages
