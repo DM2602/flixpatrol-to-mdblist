@@ -515,13 +515,93 @@ class MDBListClient:
         return self._req("POST", f"/lists/{list_id}/items/remove", json=payload)
 
     def search(self, query: str, media_type: str = "any") -> list[dict]:
+        """
+        Search for media on MDBList.
+        Tries multiple endpoint patterns since the API has evolved.
+        """
+        # The new API endpoint is /search/media/{type}
+        type_slug = {"movie": "movie", "show": "show"}.get(media_type, "any")
         params = {"s": query}
+
+        # Try new API path: /search/media/{type}
+        r = self._req("GET", f"/search/media/{type_slug}", params=params)
+        if r is not None:
+            if isinstance(r, dict) and "search" in r:
+                return r["search"]
+            if isinstance(r, list):
+                return r
+            return []
+
+        # Fallback: try /search with ?m= param (old pattern)
         if media_type in ("movie", "show"):
             params["m"] = media_type
         r = self._req("GET", "/search", params=params)
-        if isinstance(r, dict) and "search" in r:
-            return r["search"]
-        return r if isinstance(r, list) else []
+        if r is not None:
+            if isinstance(r, dict) and "search" in r:
+                return r["search"]
+            if isinstance(r, list):
+                return r
+
+        return []
+
+
+# ---------------------------------------------------------------------------
+# TMDB API client (fallback search)
+# ---------------------------------------------------------------------------
+
+TMDB_API_BASE = "https://api.themoviedb.org/3"
+# TMDB provides a free API key for personal use. This is a read-only key
+# used solely for searching titles. Users can override with their own key.
+TMDB_DEFAULT_KEY = ""  # Set via TMDB_API_KEY env var
+
+
+class TMDBClient:
+    """Minimal TMDB API client for title search (fallback when MDBList search fails)."""
+
+    def __init__(self, api_key: str = ""):
+        self.api_key = api_key
+        self.session = requests.Session()
+
+    @property
+    def available(self) -> bool:
+        return bool(self.api_key)
+
+    def search(self, query: str, media_type: str = "movie",
+               year: Optional[int] = None) -> list[dict]:
+        if not self.api_key:
+            return []
+
+        endpoint = "/search/movie" if media_type == "movie" else "/search/tv"
+        params = {"api_key": self.api_key, "query": query, "language": "en-US"}
+        if year:
+            key = "year" if media_type == "movie" else "first_air_date_year"
+            params[key] = year
+
+        try:
+            r = self.session.get(f"{TMDB_API_BASE}{endpoint}",
+                                params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            results = data.get("results", [])
+            # Normalize to our format
+            out = []
+            for item in results:
+                title = item.get("title") or item.get("name", "")
+                yr = None
+                rd = item.get("release_date") or item.get("first_air_date", "")
+                if rd and len(rd) >= 4:
+                    yr = int(rd[:4])
+                out.append({
+                    "title": title,
+                    "year": yr,
+                    "type": media_type,
+                    "tmdb_id": item.get("id"),
+                    "ids": {"tmdb": item.get("id")},
+                })
+            return out
+        except requests.RequestException as e:
+            logger.debug(f"TMDB search error: {e}")
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -535,10 +615,13 @@ class TitleMatcher:
     Strategy (in order):
       1. Use IMDB ID directly from the FlixPatrol title page (most reliable)
       2. Search MDBList by title+year with strict type filtering
+      3. Search TMDB as fallback (if TMDB_API_KEY is set)
     """
 
-    def __init__(self, mdblist: MDBListClient, cache: FileCache):
+    def __init__(self, mdblist: MDBListClient, cache: FileCache,
+                 tmdb: Optional[TMDBClient] = None):
         self.mdb = mdblist
+        self.tmdb = tmdb
         self.cache = cache
 
     def find(self, title: str, title_info: dict, media_type: str) -> Optional[dict]:
@@ -572,6 +655,14 @@ class TitleMatcher:
         # Fallback: title only
         if not best:
             results = self.mdb.search(title, mtype)
+            best = self._best_match(results, title, year, media_type)
+
+        # --- Strategy 3: TMDB fallback ---
+        if not best and self.tmdb and self.tmdb.available:
+            logger.debug(f"  MDBList search failed, trying TMDB for '{title}'")
+            results = self.tmdb.search(title, mtype, year)
+            if not results and year:
+                results = self.tmdb.search(title, mtype)
             best = self._best_match(results, title, year, media_type)
 
         self.cache.set(cache_key, best if best else "_MISS_")
@@ -791,7 +882,16 @@ def run_sync(cfg: dict):
 
     mdb = MDBListClient(cfg["MDBList"]["apiKey"])
     scraper = FlixPatrolScraper(cache)
-    matcher = TitleMatcher(mdb, cache)
+
+    # TMDB fallback search (optional, set TMDB_API_KEY env var)
+    tmdb_key = os.environ.get("TMDB_API_KEY", "")
+    tmdb = TMDBClient(tmdb_key) if tmdb_key else None
+    if tmdb and tmdb.available:
+        logger.info("TMDB fallback search: enabled")
+    else:
+        logger.info("TMDB fallback search: disabled (set TMDB_API_KEY to enable)")
+
+    matcher = TitleMatcher(mdb, cache, tmdb)
 
     limits = mdb.get_limits()
     if limits:
