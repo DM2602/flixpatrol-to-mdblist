@@ -16,12 +16,12 @@ import signal
 import sys
 import time
 import hashlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from scheduler import Scheduler
 
@@ -31,7 +31,6 @@ from scheduler import Scheduler
 
 FLIXPATROL_BASE = "https://flixpatrol.com"
 MDBLIST_API_BASE = "https://api.mdblist.com"
-MDBLIST_SEARCH_URL = "https://mdblist.com/api/"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -156,6 +155,31 @@ class FileCache:
 # ---------------------------------------------------------------------------
 # FlixPatrol scraper
 # ---------------------------------------------------------------------------
+#
+# The FlixPatrol top-10 page has this HTML structure (verified 2026-05-02):
+#
+#   <h3>TOP 10 Movies</h3>
+#   <table>
+#     <tr>
+#       <td>1.</td> <td>–</td>
+#       <td><a href="/title/apex-2026/">Apex</a></td>
+#       <td>4 d</td>
+#     </tr>
+#     ...
+#   </table>
+#
+#   <h3>TOP 10 TV Shows</h3>
+#   <table> ... </table>
+#
+#   <h3>TOP 10 Kids Movies</h3>
+#   <table> ... </table>
+#
+#   <h3>TOP 10 Kids TV Shows</h3>
+#   <table> ... </table>
+#
+# Strategy: find each h3 heading, determine its section type, then parse
+# the first <table> that follows it.
+
 
 class FlixPatrolScraper:
     def __init__(self, cache: FileCache):
@@ -177,63 +201,139 @@ class FlixPatrolScraper:
 
     def get_top10(self, platform: str, location: str, media_type: str = "both",
                   limit: int = 10, fallback=False, kids: bool = False) -> list[dict]:
+        """
+        Fetch a top-10 list. media_type is "movies", "shows", or "both".
+        Returns list of dicts: {title, url, type, rank}
+        """
+        url = f"{FLIXPATROL_BASE}/top10/{platform}/{location}"
+
+        # Cache the full page HTML to avoid re-fetching for movies+shows
+        cache_key = f"fp:page:{platform}:{location}"
+        cached_html = self.cache.get(cache_key)
+        if cached_html is not None:
+            soup = BeautifulSoup(cached_html, "html.parser")
+        else:
+            soup = self._get(url)
+            if soup:
+                self.cache.set(cache_key, str(soup))
+
+        if not soup and fallback and fallback != location:
+            logger.info(f"No page for {platform}/{location}, fallback → {fallback}")
+            url = f"{FLIXPATROL_BASE}/top10/{platform}/{fallback}"
+            soup = self._get(url)
+
+        if not soup:
+            return []
+
+        sections = self._parse_sections(soup)
         results = []
-        for mtype in self._types(media_type):
-            ck = f"fp:top10:{platform}:{location}:{mtype}:{kids}"
-            cached = self.cache.get(ck)
-            if cached is not None:
-                results.extend(cached)
-                continue
 
-            url = f"{FLIXPATROL_BASE}/top10/{platform}/{location}"
-            if kids:
-                url += "/kids"
-            items = self._scrape_top10(url, mtype)
-
-            if not items and fallback and fallback != location:
-                logger.info(f"Fallback to {fallback} for {platform}/{mtype}")
-                url2 = f"{FLIXPATROL_BASE}/top10/{platform}/{fallback}"
-                items = self._scrape_top10(url2, mtype)
-
-            self.cache.set(ck, items)
+        for mtype in _split_types(media_type):
+            section_key = (mtype, kids)
+            items = sections.get(section_key, [])
+            item_type = "movie" if mtype == "movies" else "show"
+            for item in items:
+                item["type"] = item_type
             results.extend(items)
 
         return results[:limit]
 
-    def _scrape_top10(self, url: str, media_type: str) -> list[dict]:
-        soup = self._get(url)
-        if not soup:
-            return []
+    def _parse_sections(self, soup: BeautifulSoup) -> dict:
+        """
+        Parse the page into sections keyed by (type, kids).
+        Returns: {("movies", False): [...], ("shows", False): [...], ...}
+        """
+        sections = {}
+        headings = soup.find_all(["h2", "h3"])
 
-        items = []
-        # FlixPatrol renders movies and shows in separate div.card blocks,
-        # each preceded by a heading like "TOP Movies on …" / "TOP TV Shows on …"
-        target_keywords = ["movie"] if media_type == "movies" else ["show", "tv show"]
-        section = None
-        for card in soup.select("div.card"):
-            heading = card.find_previous(["h1", "h2", "h3", "h4", "h5"])
-            if heading:
-                heading_text = heading.get_text(strip=True).lower()
-                if any(kw in heading_text for kw in target_keywords):
-                    section = card
+        for heading in headings:
+            ht = heading.get_text(strip=True).lower()
+
+            section_key = self._classify_heading(ht)
+            if not section_key:
+                continue
+
+            table = self._find_next_table(heading)
+            if not table:
+                continue
+
+            items = self._parse_table(table)
+            if items:
+                sections[section_key] = items
+                logger.debug(f"  Section '{ht}' → {len(items)} items")
+
+        return sections
+
+    @staticmethod
+    def _classify_heading(text: str) -> Optional[tuple]:
+        """
+        Classify a heading like "TOP 10 Movies" or "TOP 10 Kids TV Shows"
+        into a (type, kids) tuple.
+        """
+        text = text.strip().lower()
+
+        # Must contain "top" to be a ranking heading
+        if "top" not in text:
+            return None
+
+        is_kids = "kids" in text
+
+        # Order matters: check "tv shows" before "movies" because
+        # "kids tv shows" contains neither "movie" alone
+        if "tv show" in text or "tv-show" in text or "shows" in text:
+            return ("shows", is_kids)
+        if "movie" in text:
+            return ("movies", is_kids)
+
+        return None
+
+    @staticmethod
+    def _find_next_table(element: Tag) -> Optional[Tag]:
+        """Find the first <table> after the given heading."""
+        # Walk siblings
+        sib = element.find_next_sibling()
+        while sib:
+            if isinstance(sib, Tag):
+                if sib.name == "table":
+                    return sib
+                tbl = sib.find("table")
+                if tbl:
+                    return tbl
+                # Stop if we hit the next heading
+                if sib.name in ("h2", "h3"):
                     break
+            sib = sib.find_next_sibling()
 
-        search_root = section if section else soup
+        # Broader fallback: next table anywhere in the document after heading
+        return element.find_next("table")
 
-        for link in search_root.select("a[href*='/title/']"):
+    @staticmethod
+    def _parse_table(table: Tag) -> list[dict]:
+        """Extract title entries from a FlixPatrol ranking table."""
+        items = []
+        for row in table.find_all("tr"):
+            link = row.find("a", href=re.compile(r"/title/"))
+            if not link:
+                continue
             title = link.get_text(strip=True)
             href = link.get("href", "")
             if not title or not href:
                 continue
+
             full_url = (FLIXPATROL_BASE + href) if href.startswith("/") else href
+
+            rank = len(items) + 1
+            cells = row.find_all("td")
+            if cells:
+                rank_text = cells[0].get_text(strip=True).rstrip(".")
+                if rank_text.isdigit():
+                    rank = int(rank_text)
+
             items.append({
                 "title": title,
                 "url": full_url,
-                "type": "movie" if media_type == "movies" else "show",
-                "rank": len(items) + 1,
+                "rank": rank,
             })
-
-        logger.debug(f"Scraped {len(items)} {media_type} from {url}")
         return items
 
     # --- popular ---
@@ -241,78 +341,124 @@ class FlixPatrolScraper:
     def get_popular(self, platform: str, media_type: str = "both",
                     limit: int = 100) -> list[dict]:
         results = []
-        for mtype in self._types(media_type):
-            ck = f"fp:pop:{platform}:{mtype}"
-            cached = self.cache.get(ck)
+        for mtype in _split_types(media_type):
+            slug = {"movie-db": "movie-database",
+                    "tmdb": "the-movie-database"}.get(platform, platform)
+            url = f"{FLIXPATROL_BASE}/popular/{mtype}/{slug}"
+
+            cache_key = f"fp:pop:{platform}:{mtype}"
+            cached = self.cache.get(cache_key)
             if cached is not None:
                 results.extend(cached)
                 continue
 
-            slug = {"movie-db": "movie-database", "tmdb": "the-movie-database"}.get(platform, platform)
-            url = f"{FLIXPATROL_BASE}/popular/{mtype}/{slug}"
-            items = self._scrape_popular(url, mtype)
-            self.cache.set(ck, items)
+            soup = self._get(url)
+            if not soup:
+                continue
+
+            items = []
+            for link in soup.find_all("a", href=re.compile(r"/title/")):
+                title = link.get_text(strip=True)
+                href = link.get("href", "")
+                if title and href:
+                    full_url = (FLIXPATROL_BASE + href) if href.startswith("/") else href
+                    items.append({
+                        "title": title, "url": full_url,
+                        "type": "movie" if mtype == "movies" else "show",
+                        "rank": len(items) + 1,
+                    })
+            self.cache.set(cache_key, items)
             results.extend(items)
 
         return results[:limit]
 
-    def _scrape_popular(self, url: str, media_type: str) -> list[dict]:
-        soup = self._get(url)
-        if not soup:
-            return []
-        items = []
-        for link in soup.select("a[href*='/title/']"):
-            title = link.get_text(strip=True)
-            href = link.get("href", "")
-            if title and href:
-                full_url = (FLIXPATROL_BASE + href) if href.startswith("/") else href
-                items.append({
-                    "title": title, "url": full_url,
-                    "type": "movie" if media_type == "movies" else "show",
-                    "rank": len(items) + 1,
-                })
-        return items
+    # --- FlixPatrol title page → year + IMDB ID ---
 
-    # --- year extraction ---
-
-    def get_title_year(self, title_url: str) -> Optional[int]:
-        ck = f"fp:year:{title_url}"
-        cached = self.cache.get(ck)
+    def get_title_info(self, title_url: str) -> dict:
+        """
+        Fetch a FlixPatrol title page and extract:
+          - year (int or None)
+          - media_type_hint ("movie" or "show" or None)
+          - imdb_id (str or None) — if FlixPatrol links to IMDB
+        """
+        cache_key = f"fp:title:{title_url}"
+        cached = self.cache.get(cache_key)
         if cached is not None:
             return cached
 
+        info = {"year": None, "imdb_id": None, "media_type_hint": None}
         soup = self._get(title_url)
         if not soup:
-            return None
+            return info
 
-        year = None
-        # Try various patterns
-        for el in soup.select("span, div.year, span.year"):
-            m = re.match(r"^(\d{4})$", el.get_text(strip=True))
-            if m:
-                y = int(m.group(1))
-                if 1900 <= y <= 2030:
-                    year = y
+        # --- Strategy 1: JSON-LD schema (most reliable) ---
+        # FlixPatrol embeds: {"@type":"Movie","name":"Apex","dateCreated":"2026-04-24"}
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                ld = json.loads(script.string or "")
+                if isinstance(ld, dict):
+                    # Year from dateCreated
+                    dc = ld.get("dateCreated", "")
+                    if dc:
+                        m = re.match(r"(\d{4})", dc)
+                        if m:
+                            info["year"] = int(m.group(1))
+                    # Type hint
+                    schema_type = ld.get("@type", "").lower()
+                    if schema_type == "movie":
+                        info["media_type_hint"] = "movie"
+                    elif schema_type in ("tvseries", "tvshow", "series"):
+                        info["media_type_hint"] = "show"
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # --- Strategy 2: Date from page metadata (e.g. "04/24/2026") ---
+        if not info["year"]:
+            page_text = soup.get_text()
+            # Match MM/DD/YYYY pattern used in the metadata bar
+            for m in re.finditer(r"\b(\d{2}/\d{2}/(\d{4}))\b", page_text):
+                y = int(m.group(2))
+                if 1900 <= y <= 2035:
+                    info["year"] = y
                     break
 
-        if not year:
-            title_tag = soup.select_one("title")
-            if title_tag:
-                m = re.search(r"\((\d{4})\)", title_tag.get_text())
+        # --- Strategy 3: Bare year in span ---
+        if not info["year"]:
+            for span in soup.find_all("span"):
+                text = span.get_text(strip=True)
+                m = re.match(r"^(\d{4})$", text)
                 if m:
-                    year = int(m.group(1))
+                    y = int(m.group(1))
+                    if 1900 <= y <= 2035:
+                        info["year"] = y
+                        break
 
-        if year:
-            self.cache.set(ck, year)
-        return year
+        # --- Strategy 4: Year from URL slug (e.g. /title/apex-2026/) ---
+        if not info["year"]:
+            m = re.search(r"/title/.*-(\d{4})/?$", title_url)
+            if m:
+                y = int(m.group(1))
+                if 1900 <= y <= 2035:
+                    info["year"] = y
 
-    @staticmethod
-    def _types(media_type: str) -> list[str]:
-        if media_type == "movies":
-            return ["movies"]
-        if media_type == "shows":
-            return ["shows"]
-        return ["movies", "shows"]
+        # --- IMDB link (if present) ---
+        for a in soup.find_all("a", href=True):
+            m = re.search(r"imdb\.com/title/(tt\d+)", a["href"])
+            if m:
+                info["imdb_id"] = m.group(1)
+                break
+
+        logger.debug(f"  Title info for {title_url}: {info}")
+        self.cache.set(cache_key, info)
+        return info
+
+
+def _split_types(media_type: str) -> list[str]:
+    if media_type == "movies":
+        return ["movies"]
+    if media_type == "shows":
+        return ["shows"]
+    return ["movies", "shows"]
 
 
 # ---------------------------------------------------------------------------
@@ -347,7 +493,7 @@ class MDBListClient:
         return r if isinstance(r, list) else []
 
     def create_list(self, name: str) -> Optional[dict]:
-        return self._req("POST", "/lists/user/add", json={"name": name, "private": False})
+        return self._req("POST", "/lists", json={"name": name})
 
     def get_list_items(self, list_id: int) -> Optional[dict]:
         return self._req("GET", f"/lists/{list_id}/items")
@@ -369,26 +515,13 @@ class MDBListClient:
         return self._req("POST", f"/lists/{list_id}/items/remove", json=payload)
 
     def search(self, query: str, media_type: str = "any") -> list[dict]:
-        params = {"s": query, "apikey": self.api_key}
+        params = {"s": query}
         if media_type in ("movie", "show"):
             params["m"] = media_type
-        logger.debug(f"MDBLIST SEARCH {query}")
-        try:
-            r = self.session.get(MDBLIST_SEARCH_URL, params=params, timeout=30)
-            r.raise_for_status()
-            data = r.json()
-        except requests.RequestException as e:
-            logger.error(f"MDBList search error: {e}")
-            return []
-        if isinstance(data, dict) and "search" in data:
-            return data["search"]
-        return data if isinstance(data, list) else []
-
-    def update_list(self, list_id: int, name: str, description: str, private: bool = False) -> bool:
-        r = self._req("PUT", f"/lists/{list_id}", json={
-            "name": name, "description": description, "private": private,
-        })
-        return bool(r and r.get("success"))
+        r = self._req("GET", "/search", params=params)
+        if isinstance(r, dict) and "search" in r:
+            return r["search"]
+        return r if isinstance(r, list) else []
 
 
 # ---------------------------------------------------------------------------
@@ -396,55 +529,114 @@ class MDBListClient:
 # ---------------------------------------------------------------------------
 
 class TitleMatcher:
+    """
+    Resolves FlixPatrol titles to IMDB/TMDB IDs.
+
+    Strategy (in order):
+      1. Use IMDB ID directly from the FlixPatrol title page (most reliable)
+      2. Search MDBList by title+year with strict type filtering
+    """
+
     def __init__(self, mdblist: MDBListClient, cache: FileCache):
         self.mdb = mdblist
         self.cache = cache
 
-    def find(self, title: str, year: Optional[int], media_type: str) -> Optional[dict]:
-        ck = f"match:{title}:{year}:{media_type}"
-        cached = self.cache.get(ck)
+    def find(self, title: str, title_info: dict, media_type: str) -> Optional[dict]:
+        """
+        title_info: from FlixPatrolScraper.get_title_info() with year & imdb_id.
+        media_type: "movie" or "show"
+        Returns: dict with imdb_id/tmdb_id/title/year, or None
+        """
+        year = title_info.get("year")
+        fp_imdb = title_info.get("imdb_id")
+
+        # --- Strategy 1: IMDB ID from FlixPatrol page ---
+        if fp_imdb:
+            logger.debug(f"  Using IMDB ID from FlixPatrol: {fp_imdb}")
+            return {"imdb_id": fp_imdb, "title": title, "year": year}
+
+        # --- Strategy 2: MDBList search ---
+        cache_key = f"match:{title}:{year}:{media_type}"
+        cached = self.cache.get(cache_key)
         if cached is not None:
             return cached if cached != "_MISS_" else None
 
         mtype = "movie" if media_type == "movie" else "show"
-        q = f"{title} {year}" if year else title
-        results = self.mdb.search(q, mtype)
-        if not results:
-            results = self.mdb.search(title, mtype)
+        best = None
 
-        best = self._best_match(results, title, year, media_type)
-        self.cache.set(ck, best if best else "_MISS_")
+        # Try title + year first
+        if year:
+            results = self.mdb.search(f"{title} {year}", mtype)
+            best = self._best_match(results, title, year, media_type)
+
+        # Fallback: title only
+        if not best:
+            results = self.mdb.search(title, mtype)
+            best = self._best_match(results, title, year, media_type)
+
+        self.cache.set(cache_key, best if best else "_MISS_")
         return best
 
-    def _best_match(self, results, title, year, media_type):
+    def _best_match(self, results: list, title: str, year: Optional[int],
+                    media_type: str) -> Optional[dict]:
         if not results:
             return None
-        tl = title.lower().strip()
+
+        tl = self._norm(title)
+
+        # Pass 1: exact title + year + type
         for item in results:
-            it = (item.get("title") or "").lower().strip()
-            iy = item.get("year")
-            itype = item.get("type", "")
-            if media_type == "movie" and itype not in ("movie", ""):
+            if not self._type_ok(item, media_type):
                 continue
-            if media_type == "show" and itype not in ("show", ""):
-                continue
-            if it == tl and (not year or not iy or abs(iy - year) <= 1):
+            if self._norm(item.get("title", "")) == tl and self._year_ok(year, item.get("year")):
                 return self._ids(item)
-        # fallback: first matching type
+
+        # Pass 2: exact title + type (ignore year)
         for item in results:
-            itype = item.get("type", "")
-            if media_type == "movie" and itype not in ("movie", ""):
+            if not self._type_ok(item, media_type):
                 continue
-            if media_type == "show" and itype not in ("show", ""):
+            if self._norm(item.get("title", "")) == tl:
+                return self._ids(item)
+
+        # Pass 3: first result with matching type
+        for item in results:
+            if not self._type_ok(item, media_type):
                 continue
             return self._ids(item)
+
         return None
 
     @staticmethod
+    def _norm(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r"[^\w\s]", "", s)
+        return re.sub(r"\s+", " ", s)
+
+    @staticmethod
+    def _type_ok(item: dict, media_type: str) -> bool:
+        itype = (item.get("type") or "").lower()
+        if not itype:
+            return True
+        if media_type == "movie":
+            return itype in ("movie",)
+        if media_type == "show":
+            return itype in ("show", "series", "tv")
+        return True
+
+    @staticmethod
+    def _year_ok(want: Optional[int], got: Optional[int]) -> bool:
+        if want is None or got is None:
+            return True
+        return abs(want - got) <= 1
+
+    @staticmethod
     def _ids(item: dict) -> dict:
+        ids = item.get("ids", {})
         r = {"title": item.get("title", ""), "year": item.get("year")}
-        imdb = item.get("imdbid") or item.get("imdb_id")
-        tmdb = item.get("tmdbid") or item.get("tmdb_id")
+        imdb = (ids.get("imdbid") or ids.get("imdb")
+                or item.get("imdb_id") or item.get("imdb"))
+        tmdb = (ids.get("tmdbid") or ids.get("tmdb")
+                or item.get("tmdb_id") or item.get("id"))
         if imdb:
             r["imdb_id"] = imdb
         if tmdb:
@@ -453,7 +645,7 @@ class TitleMatcher:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Sync helpers
 # ---------------------------------------------------------------------------
 
 def slugify(name: str) -> str:
@@ -486,18 +678,9 @@ def make_popular_name(cfg: dict) -> str:
     return " ".join(parts).title().replace("-", " ")
 
 
-def update_list_description(mdb: MDBListClient, list_id: int, name: str):
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    desc = f"Automatically updated by flixpatrol-to-mdblist. Last updated: {ts}"
-    if not DRY_RUN:
-        mdb.update_list(list_id, name, desc)
-        logger.info(f"  Updated description: {desc}")
-
-
 def find_or_create_list(mdb: MDBListClient, name: str, slug: str) -> Optional[int]:
     for lst in mdb.get_my_lists():
-        if (lst.get("slug") == slug or lst.get("name", "").lower() == name.lower()) \
-                and not lst.get("dynamic", False):
+        if lst.get("slug") == slug or lst.get("name", "").lower() == name.lower():
             logger.info(f"  List exists: '{lst.get('name')}' (id={lst['id']})")
             return lst["id"]
     if DRY_RUN:
@@ -508,7 +691,6 @@ def find_or_create_list(mdb: MDBListClient, name: str, slug: str) -> Optional[in
     if result and "id" in result:
         logger.info(f"  Created (id={result['id']})")
         return result["id"]
-    # re-check
     time.sleep(1)
     for lst in mdb.get_my_lists():
         if lst.get("name", "").lower() == name.lower():
@@ -529,26 +711,26 @@ def sync_items(mdb: MDBListClient, list_id: int, items: list[dict], name: str):
         logger.info(f"  [DRY RUN] Would sync {len(movies)}M + {len(shows)}S to '{name}'")
         return
 
-    # Clear existing items first
+    # Clear existing items
     existing = mdb.get_list_items(list_id)
     if existing:
-        om = [{"imdb": m["imdb_id"]} for m in existing.get("movies", []) if m.get("imdb_id")]
-        os_ = [{"imdb": s["imdb_id"]} for s in existing.get("shows", []) if s.get("imdb_id")]
+        om = [{"imdb_id": m["imdb_id"]} for m in existing.get("movies", []) if m.get("imdb_id")]
+        os_ = [{"imdb_id": s["imdb_id"]} for s in existing.get("shows", []) if s.get("imdb_id")]
         if om or os_:
             mdb.remove_items(list_id, om or None, os_ or None)
 
     r = mdb.add_items(list_id, movies or None, shows or None)
     if r:
-        logger.info(f"  Synced '{name}': added={r.get('added',{})}")
+        logger.info(f"  Synced '{name}': added={r.get('added', {})}")
     else:
         logger.info(f"  Submitted {len(movies)}M + {len(shows)}S to '{name}'")
 
 
 def _entry(item: dict) -> Optional[dict]:
     if "imdb_id" in item:
-        return {"imdb": item["imdb_id"]}
+        return {"imdb_id": item["imdb_id"]}
     if "tmdb_id" in item:
-        return {"tmdb": item["tmdb_id"]}
+        return {"tmdb_id": item["tmdb_id"]}
     return None
 
 
@@ -566,11 +748,9 @@ def load_config() -> dict:
 
     cfg = json.loads(CONFIG_FILE.read_text())
 
-    # env overrides
     env_key = os.environ.get("MDBLIST_API_KEY")
     if env_key:
         cfg.setdefault("MDBList", {})["apiKey"] = env_key
-
     env_cron = os.environ.get("SCHEDULE")
     if env_cron:
         cfg.setdefault("Schedule", {})["cron"] = env_cron
@@ -594,7 +774,6 @@ def validate_config(cfg: dict):
 # ---------------------------------------------------------------------------
 
 def run_sync(cfg: dict):
-    """Execute one full sync cycle."""
     start = time.time()
     logger.info("=" * 55)
     logger.info("Starting sync cycle")
@@ -614,26 +793,27 @@ def run_sync(cfg: dict):
     scraper = FlixPatrolScraper(cache)
     matcher = TitleMatcher(mdb, cache)
 
-    # Show limits
     limits = mdb.get_limits()
     if limits:
         logger.info(
-            f"MDBList API: {limits.get('api_requests_count',0)}/"
-            f"{limits.get('api_requests',1000)} requests used"
+            f"MDBList API: {limits.get('api_requests_count', 0)}/"
+            f"{limits.get('api_requests', 1000)} requests used"
         )
 
     # --- Top 10 ---
-    for i, t10 in enumerate(cfg.get("FlixPatrolTop10", [])):
+    for t10 in cfg.get("FlixPatrolTop10", []):
         name = t10.get("name") or make_top10_name(t10)
         slug = slugify(name) if t10.get("normalizeName", True) else name
+        kids = t10.get("kids", False)
         logger.info(f"\n▶ Top10: {name}")
         logger.info(f"  {t10.get('platform')}/{t10.get('location')} "
-                     f"type={t10.get('type','both')} limit={t10.get('limit',10)}")
+                     f"type={t10.get('type', 'both')} limit={t10.get('limit', 10)}"
+                     f"{' kids=true' if kids else ''}")
 
         fp = scraper.get_top10(
             t10["platform"], t10.get("location", "world"),
             t10.get("type", "both"), t10.get("limit", 10),
-            t10.get("fallback", False), t10.get("kids", False),
+            t10.get("fallback", False), kids,
         )
         if not fp:
             logger.warning("  No items from FlixPatrol")
@@ -648,12 +828,11 @@ def run_sync(cfg: dict):
         lid = find_or_create_list(mdb, name, slug)
         if lid is not None:
             sync_items(mdb, lid, matched, name)
-            update_list_description(mdb, lid, name)
         elif DRY_RUN:
             sync_items(mdb, 0, matched, name)
 
     # --- Popular ---
-    for i, pop in enumerate(cfg.get("FlixPatrolPopular", [])):
+    for pop in cfg.get("FlixPatrolPopular", []):
         name = pop.get("name") or make_popular_name(pop)
         slug = slugify(name) if pop.get("normalizeName", True) else name
         logger.info(f"\n▶ Popular: {name}")
@@ -673,7 +852,6 @@ def run_sync(cfg: dict):
         lid = find_or_create_list(mdb, name, slug)
         if lid is not None:
             sync_items(mdb, lid, matched, name)
-            update_list_description(mdb, lid, name)
         elif DRY_RUN:
             sync_items(mdb, 0, matched, name)
 
@@ -687,12 +865,16 @@ def _match_all(fp_items: list, scraper: FlixPatrolScraper,
                matcher: TitleMatcher) -> list[dict]:
     matched = []
     for item in fp_items:
-        year = scraper.get_title_year(item["url"]) if item.get("url") else None
-        ids = matcher.find(item["title"], year, item["type"])
+        title_info = scraper.get_title_info(item["url"]) if item.get("url") else {}
+        media_type = item.get("type", "movie")
+
+        ids = matcher.find(item["title"], title_info, media_type)
         if ids:
-            ids["type"] = item["type"]
+            ids["type"] = media_type
             matched.append(ids)
-            logger.info(f"  ✓ {item['title']} → {ids.get('imdb_id','?')}")
+            imdb = ids.get("imdb_id", "?")
+            src = "FlixPatrol" if title_info.get("imdb_id") else "MDBList search"
+            logger.info(f"  ✓ {item['title']} → {imdb} (via {src})")
         else:
             logger.warning(f"  ✗ {item['title']} – not found")
         time.sleep(0.3)
@@ -705,7 +887,7 @@ def _match_all(fp_items: list, scraper: FlixPatrolScraper,
 
 def main():
     logger.info("╔═══════════════════════════════════════════════════════╗")
-    logger.info("║       FlixPatrol → MDBList Sync  v1.0.0             ║")
+    logger.info("║       FlixPatrol → MDBList Sync  v1.1.0             ║")
     logger.info("╚═══════════════════════════════════════════════════════╝")
 
     cfg = load_config()
@@ -715,7 +897,6 @@ def main():
     cron_expr = os.environ.get("SCHEDULE") or sched_cfg.get("cron", "0 6,18 * * *")
     run_on_start = sched_cfg.get("runOnStart", True)
 
-    # Allow RUN_ONCE mode (for testing / external cron)
     if os.environ.get("RUN_ONCE", "false").lower() == "true":
         logger.info("RUN_ONCE mode – executing once and exiting")
         run_sync(cfg)
@@ -725,7 +906,6 @@ def main():
     logger.info(f"Schedule: {cron_expr}")
     logger.info(f"Next run: {scheduler.next_run_str()}")
 
-    # Graceful shutdown
     stop = False
     def _signal(sig, frame):
         nonlocal stop
@@ -737,14 +917,12 @@ def main():
     if run_on_start:
         logger.info("runOnStart=true → running initial sync now")
         run_sync(cfg)
-        # Reload config in case it changed
         cfg = load_config()
 
     while not stop:
         sleep_sec = scheduler.seconds_until_next()
         logger.info(f"Sleeping {_fmt_dur(sleep_sec)} until {scheduler.next_run_str()}")
 
-        # Sleep in small increments so we can respond to signals
         deadline = time.time() + sleep_sec
         while time.time() < deadline and not stop:
             time.sleep(min(30, deadline - time.time()))
@@ -752,7 +930,6 @@ def main():
         if stop:
             break
 
-        # Reload config each cycle (allows live edits)
         cfg = load_config()
         validate_config(cfg)
         run_sync(cfg)
