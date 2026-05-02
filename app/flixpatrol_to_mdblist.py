@@ -578,11 +578,13 @@ class TMDBClient:
             params[key] = year
 
         try:
-            r = self.session.get(f"{TMDB_API_BASE}{endpoint}",
-                                params=params, timeout=15)
+            url = f"{TMDB_API_BASE}{endpoint}"
+            logger.debug(f"TMDB search: {url} query={query} year={year}")
+            r = self.session.get(url, params=params, timeout=15)
             r.raise_for_status()
             data = r.json()
             results = data.get("results", [])
+            logger.debug(f"TMDB returned {len(results)} results for '{query}'")
             # Normalize to our format
             out = []
             for item in results:
@@ -600,7 +602,7 @@ class TMDBClient:
                 })
             return out
         except requests.RequestException as e:
-            logger.debug(f"TMDB search error: {e}")
+            logger.error(f"TMDB search error for '{query}': {e}")
             return []
 
 
@@ -614,8 +616,7 @@ class TitleMatcher:
 
     Strategy (in order):
       1. Use IMDB ID directly from the FlixPatrol title page (most reliable)
-      2. Search MDBList by title+year with strict type filtering
-      3. Search TMDB as fallback (if TMDB_API_KEY is set)
+      2. Search TMDB by title+year (requires TMDB_API_KEY env var)
     """
 
     def __init__(self, mdblist: MDBListClient, cache: FileCache,
@@ -625,111 +626,93 @@ class TitleMatcher:
         self.cache = cache
 
     def find(self, title: str, title_info: dict, media_type: str) -> Optional[dict]:
-        """
-        title_info: from FlixPatrolScraper.get_title_info() with year & imdb_id.
-        media_type: "movie" or "show"
-        Returns: dict with imdb_id/tmdb_id/title/year, or None
-        """
         year = title_info.get("year")
         fp_imdb = title_info.get("imdb_id")
 
         # --- Strategy 1: IMDB ID from FlixPatrol page ---
         if fp_imdb:
-            logger.debug(f"  Using IMDB ID from FlixPatrol: {fp_imdb}")
-            return {"imdb_id": fp_imdb, "title": title, "year": year}
+            return {"imdb_id": fp_imdb, "title": title, "year": year,
+                    "_src": "FlixPatrol"}
 
-        # --- Strategy 2: MDBList search ---
-        cache_key = f"match:{title}:{year}:{media_type}"
+        # --- Check cache ---
+        cache_key = f"match:v2:{title}:{year}:{media_type}"
         cached = self.cache.get(cache_key)
         if cached is not None:
             return cached if cached != "_MISS_" else None
 
-        mtype = "movie" if media_type == "movie" else "show"
+        # --- Strategy 2: TMDB search ---
         best = None
+        if self.tmdb and self.tmdb.available:
+            mtype = "movie" if media_type == "movie" else "show"
 
-        # Try title + year first
-        if year:
-            results = self.mdb.search(f"{title} {year}", mtype)
-            best = self._best_match(results, title, year, media_type)
+            # Try with year first (more precise)
+            if year:
+                results = self.tmdb.search(title, mtype, year)
+                best = self._pick(results, title, year, media_type)
 
-        # Fallback: title only
-        if not best:
-            results = self.mdb.search(title, mtype)
-            best = self._best_match(results, title, year, media_type)
-
-        # --- Strategy 3: TMDB fallback ---
-        if not best and self.tmdb and self.tmdb.available:
-            logger.debug(f"  MDBList search failed, trying TMDB for '{title}'")
-            results = self.tmdb.search(title, mtype, year)
-            if not results and year:
+            # Retry without year
+            if not best:
                 results = self.tmdb.search(title, mtype)
-            best = self._best_match(results, title, year, media_type)
+                best = self._pick(results, title, year, media_type)
 
-        self.cache.set(cache_key, best if best else "_MISS_")
+            if best:
+                best["_src"] = "TMDB"
+
+        if best:
+            self.cache.set(cache_key, best)
+        else:
+            self.cache.set(cache_key, "_MISS_")
         return best
 
-    def _best_match(self, results: list, title: str, year: Optional[int],
-                    media_type: str) -> Optional[dict]:
+    def _pick(self, results: list, title: str, year: Optional[int],
+              media_type: str) -> Optional[dict]:
+        """Pick the best match from search results. Only returns items with IDs."""
         if not results:
             return None
 
         tl = self._norm(title)
 
-        # Pass 1: exact title + year + type
+        # Pass 1: exact title + year match
         for item in results:
-            if not self._type_ok(item, media_type):
-                continue
-            if self._norm(item.get("title", "")) == tl and self._year_ok(year, item.get("year")):
-                return self._ids(item)
+            it = self._norm(item.get("title", ""))
+            iy = item.get("year")
+            if it == tl and self._year_ok(year, iy):
+                r = self._extract_ids(item)
+                if r:
+                    return r
 
-        # Pass 2: exact title + type (ignore year)
+        # Pass 2: exact title, ignore year
         for item in results:
-            if not self._type_ok(item, media_type):
-                continue
-            if self._norm(item.get("title", "")) == tl:
-                return self._ids(item)
+            it = self._norm(item.get("title", ""))
+            if it == tl:
+                r = self._extract_ids(item)
+                if r:
+                    return r
 
-        # Pass 3: first result with matching type
+        # Pass 3: first result with any ID
         for item in results:
-            if not self._type_ok(item, media_type):
-                continue
-            return self._ids(item)
+            r = self._extract_ids(item)
+            if r:
+                return r
 
         return None
 
     @staticmethod
-    def _norm(s: str) -> str:
-        s = s.lower().strip()
-        s = re.sub(r"[^\w\s]", "", s)
-        return re.sub(r"\s+", " ", s)
-
-    @staticmethod
-    def _type_ok(item: dict, media_type: str) -> bool:
-        itype = (item.get("type") or "").lower()
-        if not itype:
-            return True
-        if media_type == "movie":
-            return itype in ("movie",)
-        if media_type == "show":
-            return itype in ("show", "series", "tv")
-        return True
-
-    @staticmethod
-    def _year_ok(want: Optional[int], got: Optional[int]) -> bool:
-        if want is None or got is None:
-            return True
-        return abs(want - got) <= 1
-
-    @staticmethod
-    def _ids(item: dict) -> dict:
+    def _extract_ids(item: dict) -> Optional[dict]:
+        """Extract IDs from a search result. Returns None if no usable ID found."""
         ids = item.get("ids", {})
-        r = {"title": item.get("title", ""), "year": item.get("year")}
         imdb = (ids.get("imdbid") or ids.get("imdb")
                 or item.get("imdb_id") or item.get("imdb"))
         tmdb = (ids.get("tmdbid") or ids.get("tmdb")
                 or item.get("tmdb_id") or item.get("id"))
+
+        # CRITICAL: only return if we have at least one usable ID
+        if not imdb and not tmdb:
+            return None
+
+        r = {"title": item.get("title", ""), "year": item.get("year")}
         if imdb:
-            r["imdb_id"] = imdb
+            r["imdb_id"] = str(imdb)
         if tmdb:
             r["tmdb_id"] = int(tmdb) if isinstance(tmdb, (int, float)) else tmdb
         return r
@@ -969,12 +952,12 @@ def _match_all(fp_items: list, scraper: FlixPatrolScraper,
         media_type = item.get("type", "movie")
 
         ids = matcher.find(item["title"], title_info, media_type)
-        if ids:
+        if ids and (ids.get("imdb_id") or ids.get("tmdb_id")):
             ids["type"] = media_type
             matched.append(ids)
-            imdb = ids.get("imdb_id", "?")
-            src = "FlixPatrol" if title_info.get("imdb_id") else "MDBList search"
-            logger.info(f"  ✓ {item['title']} → {imdb} (via {src})")
+            id_str = ids.get("imdb_id") or f"tmdb:{ids.get('tmdb_id')}"
+            src = ids.pop("_src", "unknown")
+            logger.info(f"  ✓ {item['title']} → {id_str} (via {src})")
         else:
             logger.warning(f"  ✗ {item['title']} – not found")
         time.sleep(0.3)
