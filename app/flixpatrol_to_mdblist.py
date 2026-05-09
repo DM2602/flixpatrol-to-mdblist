@@ -717,6 +717,18 @@ class TitleMatcher:
             r["tmdb_id"] = int(tmdb) if isinstance(tmdb, (int, float)) else tmdb
         return r
 
+    @staticmethod
+    def _norm(s: str) -> str:
+        s = s.lower().strip()
+        s = re.sub(r"[^\w\s]", "", s)
+        return re.sub(r"\s+", " ", s)
+
+    @staticmethod
+    def _year_ok(want: Optional[int], got: Optional[int]) -> bool:
+        if want is None or got is None:
+            return True
+        return abs(want - got) <= 1
+
 
 # ---------------------------------------------------------------------------
 # Sync helpers
