@@ -493,69 +493,49 @@ class MDBListClient:
         return r if isinstance(r, list) else []
 
     def create_list(self, name: str) -> Optional[dict]:
-        return self._req("POST", "/lists", json={"name": name})
+        # API docs: POST /lists/user/add
+        return self._req("POST", "/lists/user/add", json={"name": name})
 
     def get_list_items(self, list_id: int) -> Optional[dict]:
         return self._req("GET", f"/lists/{list_id}/items")
 
-    def add_item(self, list_id: int, media_type: str, imdb_id: str = None,
-                 tmdb_id: int = None) -> Optional[dict]:
+    def add_items(self, list_id: int, movies: list = None, shows: list = None):
         """
-        Add a single item to a static list.
-        Uses query parameters: movie_imdb, movie_tmdb, show_imdb, show_tmdb
-        Matches the CLI pattern: update list-items -a add -i {id} --movie-imdb tt...
+        Add items to a static list via JSON body.
+        API docs: POST /lists/{listid}/items/add
+        Items use keys: tmdb, imdb (NOT tmdb_id, imdb_id)
         """
-        params = {}
-        prefix = "movie" if media_type == "movie" else "show"
-        if imdb_id:
-            params[f"{prefix}_imdb"] = imdb_id
-        elif tmdb_id:
-            params[f"{prefix}_tmdb"] = tmdb_id
-        else:
-            return None
-        return self._req("POST", f"/lists/{list_id}/items/add", params=params)
+        payload = {}
+        if movies:
+            payload["movies"] = movies
+        if shows:
+            payload["shows"] = shows
+        return self._req("POST", f"/lists/{list_id}/items/add", json=payload)
 
-    def remove_item(self, list_id: int, media_type: str, imdb_id: str = None,
-                    tmdb_id: int = None) -> Optional[dict]:
-        """Remove a single item from a static list."""
-        params = {}
-        prefix = "movie" if media_type == "movie" else "show"
-        if imdb_id:
-            params[f"{prefix}_imdb"] = imdb_id
-        elif tmdb_id:
-            params[f"{prefix}_tmdb"] = tmdb_id
-        else:
-            return None
-        return self._req("POST", f"/lists/{list_id}/items/remove", params=params)
+    def remove_items(self, list_id: int, movies: list = None, shows: list = None):
+        """
+        Remove items from a static list via JSON body.
+        API docs: POST /lists/{listid}/items/remove
+        """
+        payload = {}
+        if movies:
+            payload["movies"] = movies
+        if shows:
+            payload["shows"] = shows
+        return self._req("POST", f"/lists/{list_id}/items/remove", json=payload)
 
     def search(self, query: str, media_type: str = "any") -> list[dict]:
         """
         Search for media on MDBList.
-        Tries multiple endpoint patterns since the API has evolved.
+        API docs: GET /search/{media_type}?query=...
         """
-        # The new API endpoint is /search/media/{type}
         type_slug = {"movie": "movie", "show": "show"}.get(media_type, "any")
-        params = {"s": query}
-
-        # Try new API path: /search/media/{type}
-        r = self._req("GET", f"/search/media/{type_slug}", params=params)
-        if r is not None:
-            if isinstance(r, dict) and "search" in r:
-                return r["search"]
-            if isinstance(r, list):
-                return r
-            return []
-
-        # Fallback: try /search with ?m= param (old pattern)
-        if media_type in ("movie", "show"):
-            params["m"] = media_type
-        r = self._req("GET", "/search", params=params)
-        if r is not None:
-            if isinstance(r, dict) and "search" in r:
-                return r["search"]
-            if isinstance(r, list):
-                return r
-
+        params = {"query": query}
+        r = self._req("GET", f"/search/{type_slug}", params=params)
+        if isinstance(r, dict) and "search" in r:
+            return r["search"]
+        if isinstance(r, list):
+            return r
         return []
 
 
@@ -649,26 +629,28 @@ class TitleMatcher:
                     "_src": "FlixPatrol"}
 
         # --- Check cache ---
-        cache_key = f"match:v2:{title}:{year}:{media_type}"
+        cache_key = f"match:v3:{title}:{year}:{media_type}"
         cached = self.cache.get(cache_key)
         if cached is not None:
             return cached if cached != "_MISS_" else None
 
-        # --- Strategy 2: TMDB search ---
+        mtype = "movie" if media_type == "movie" else "show"
         best = None
-        if self.tmdb and self.tmdb.available:
-            mtype = "movie" if media_type == "movie" else "show"
 
-            # Try with year first (more precise)
+        # --- Strategy 2: MDBList search (has IMDB IDs) ---
+        results = self.mdb.search(title, mtype)
+        best = self._pick(results, title, year, media_type)
+        if best:
+            best["_src"] = "MDBList"
+
+        # --- Strategy 3: TMDB search (fallback) ---
+        if not best and self.tmdb and self.tmdb.available:
             if year:
                 results = self.tmdb.search(title, mtype, year)
                 best = self._pick(results, title, year, media_type)
-
-            # Retry without year
             if not best:
                 results = self.tmdb.search(title, mtype)
                 best = self._pick(results, title, year, media_type)
-
             if best:
                 best["_src"] = "TMDB"
 
@@ -808,40 +790,42 @@ def sync_items(mdb: MDBListClient, list_id: int, items: list[dict], name: str):
         logger.info(f"  [DRY RUN] Would sync {len(items)} items to '{name}'")
         return
 
-    # Clear existing items one by one
+    # Build add payload with correct API key names: "tmdb" and "imdb" (NOT "tmdb_id")
+    movies_add = []
+    shows_add = []
+    for item in items:
+        entry = {}
+        if item.get("imdb_id"):
+            entry["imdb"] = item["imdb_id"]
+        if item.get("tmdb_id"):
+            entry["tmdb"] = item["tmdb_id"]
+        if not entry:
+            continue
+        if item.get("type") == "movie":
+            movies_add.append(entry)
+        else:
+            shows_add.append(entry)
+
+    # Clear existing items first
     existing = mdb.get_list_items(list_id)
     if existing:
-        removed = 0
-        for m in existing.get("movies", []):
-            imdb = m.get("imdb_id")
-            if imdb:
-                mdb.remove_item(list_id, "movie", imdb_id=imdb)
-                removed += 1
-        for s in existing.get("shows", []):
-            imdb = s.get("imdb_id")
-            if imdb:
-                mdb.remove_item(list_id, "show", imdb_id=imdb)
-                removed += 1
-        if removed:
-            logger.info(f"  Removed {removed} old items from '{name}'")
+        rm_movies = [{"imdb": m["imdb_id"]} for m in existing.get("movies", []) if m.get("imdb_id")]
+        rm_shows = [{"imdb": s["imdb_id"]} for s in existing.get("shows", []) if s.get("imdb_id")]
+        if rm_movies or rm_shows:
+            r = mdb.remove_items(list_id, rm_movies or None, rm_shows or None)
+            total_rm = len(rm_movies) + len(rm_shows)
+            logger.info(f"  Removed {total_rm} old items from '{name}'")
 
-    # Add new items one by one
-    added = 0
-    failed = 0
-    for item in items:
-        media_type = item.get("type", "movie")
-        imdb_id = item.get("imdb_id")
-        tmdb_id = item.get("tmdb_id")
-        r = mdb.add_item(list_id, media_type, imdb_id=imdb_id, tmdb_id=tmdb_id)
-        if r and r.get("added", {}).get("movies", 0) + r.get("added", {}).get("shows", 0) > 0:
-            added += 1
-        elif r:
-            added += 1  # count as added even without detailed response
-        else:
-            failed += 1
-            logger.warning(f"  Failed to add: {item.get('title', '?')}")
-
-    logger.info(f"  Synced '{name}': {added} added, {failed} failed")
+    # Add new items in a single batch
+    r = mdb.add_items(list_id, movies_add or None, shows_add or None)
+    if r and "added" in r:
+        a = r["added"]
+        logger.info(
+            f"  Synced '{name}': "
+            f"{a.get('movies',0)} movies + {a.get('shows',0)} shows added"
+        )
+    else:
+        logger.info(f"  Submitted {len(movies_add)}M + {len(shows_add)}S to '{name}'")
 
 
 def _entry(item: dict) -> Optional[dict]:
