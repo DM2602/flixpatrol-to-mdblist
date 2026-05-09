@@ -498,21 +498,35 @@ class MDBListClient:
     def get_list_items(self, list_id: int) -> Optional[dict]:
         return self._req("GET", f"/lists/{list_id}/items")
 
-    def add_items(self, list_id: int, movies: list = None, shows: list = None):
-        payload = {}
-        if movies:
-            payload["movies"] = movies
-        if shows:
-            payload["shows"] = shows
-        return self._req("POST", f"/lists/{list_id}/items/add", json=payload)
+    def add_item(self, list_id: int, media_type: str, imdb_id: str = None,
+                 tmdb_id: int = None) -> Optional[dict]:
+        """
+        Add a single item to a static list.
+        Uses query parameters: movie_imdb, movie_tmdb, show_imdb, show_tmdb
+        Matches the CLI pattern: update list-items -a add -i {id} --movie-imdb tt...
+        """
+        params = {}
+        prefix = "movie" if media_type == "movie" else "show"
+        if imdb_id:
+            params[f"{prefix}_imdb"] = imdb_id
+        elif tmdb_id:
+            params[f"{prefix}_tmdb"] = tmdb_id
+        else:
+            return None
+        return self._req("POST", f"/lists/{list_id}/items/add", params=params)
 
-    def remove_items(self, list_id: int, movies: list = None, shows: list = None):
-        payload = {}
-        if movies:
-            payload["movies"] = movies
-        if shows:
-            payload["shows"] = shows
-        return self._req("POST", f"/lists/{list_id}/items/remove", json=payload)
+    def remove_item(self, list_id: int, media_type: str, imdb_id: str = None,
+                    tmdb_id: int = None) -> Optional[dict]:
+        """Remove a single item from a static list."""
+        params = {}
+        prefix = "movie" if media_type == "movie" else "show"
+        if imdb_id:
+            params[f"{prefix}_imdb"] = imdb_id
+        elif tmdb_id:
+            params[f"{prefix}_tmdb"] = tmdb_id
+        else:
+            return None
+        return self._req("POST", f"/lists/{list_id}/items/remove", params=params)
 
     def search(self, query: str, media_type: str = "any") -> list[dict]:
         """
@@ -786,30 +800,48 @@ def find_or_create_list(mdb: MDBListClient, name: str, slug: str) -> Optional[in
 
 
 def sync_items(mdb: MDBListClient, list_id: int, items: list[dict], name: str):
-    movies = [_entry(i) for i in items if i.get("type") == "movie" and _entry(i)]
-    shows = [_entry(i) for i in items if i.get("type") == "show" and _entry(i)]
-
-    if not movies and not shows:
+    if not items:
         logger.warning(f"  No matched items for '{name}'")
         return
 
     if DRY_RUN:
-        logger.info(f"  [DRY RUN] Would sync {len(movies)}M + {len(shows)}S to '{name}'")
+        logger.info(f"  [DRY RUN] Would sync {len(items)} items to '{name}'")
         return
 
-    # Clear existing items
+    # Clear existing items one by one
     existing = mdb.get_list_items(list_id)
     if existing:
-        om = [{"imdb_id": m["imdb_id"]} for m in existing.get("movies", []) if m.get("imdb_id")]
-        os_ = [{"imdb_id": s["imdb_id"]} for s in existing.get("shows", []) if s.get("imdb_id")]
-        if om or os_:
-            mdb.remove_items(list_id, om or None, os_ or None)
+        removed = 0
+        for m in existing.get("movies", []):
+            imdb = m.get("imdb_id")
+            if imdb:
+                mdb.remove_item(list_id, "movie", imdb_id=imdb)
+                removed += 1
+        for s in existing.get("shows", []):
+            imdb = s.get("imdb_id")
+            if imdb:
+                mdb.remove_item(list_id, "show", imdb_id=imdb)
+                removed += 1
+        if removed:
+            logger.info(f"  Removed {removed} old items from '{name}'")
 
-    r = mdb.add_items(list_id, movies or None, shows or None)
-    if r:
-        logger.info(f"  Synced '{name}': added={r.get('added', {})}")
-    else:
-        logger.info(f"  Submitted {len(movies)}M + {len(shows)}S to '{name}'")
+    # Add new items one by one
+    added = 0
+    failed = 0
+    for item in items:
+        media_type = item.get("type", "movie")
+        imdb_id = item.get("imdb_id")
+        tmdb_id = item.get("tmdb_id")
+        r = mdb.add_item(list_id, media_type, imdb_id=imdb_id, tmdb_id=tmdb_id)
+        if r and r.get("added", {}).get("movies", 0) + r.get("added", {}).get("shows", 0) > 0:
+            added += 1
+        elif r:
+            added += 1  # count as added even without detailed response
+        else:
+            failed += 1
+            logger.warning(f"  Failed to add: {item.get('title', '?')}")
+
+    logger.info(f"  Synced '{name}': {added} added, {failed} failed")
 
 
 def _entry(item: dict) -> Optional[dict]:
