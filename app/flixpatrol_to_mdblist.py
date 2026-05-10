@@ -474,15 +474,26 @@ class MDBListClient:
         params = params or {}
         params["apikey"] = self.api_key
         url = f"{MDBLIST_API_BASE}{path}"
-        logger.debug(f"MDBLIST {method} {path}")
+        # Log the full request details for POST requests
+        json_body = kwargs.get("json")
+        if json_body and logger.isEnabledFor(logging.DEBUG):
+            import json as _json
+            logger.debug(f"MDBLIST {method} {path} body={_json.dumps(json_body)[:500]}")
+        else:
+            logger.debug(f"MDBLIST {method} {path}")
         try:
             r = self.session.request(method, url, params=params, timeout=30, **kwargs)
             r.raise_for_status()
-            return r.json() if r.text.strip() else None
+            if r.text.strip():
+                data = r.json()
+                logger.debug(f"MDBLIST response: {str(data)[:300]}")
+                return data
+            return None
         except requests.RequestException as e:
             logger.error(f"MDBList API error ({method} {path}): {e}")
             if hasattr(e, "response") and e.response is not None:
-                logger.debug(f"Response body: {e.response.text[:500]}")
+                # Log error response body on ERROR level so it's always visible
+                logger.error(f"  Response body: {e.response.text[:500]}")
             return None
 
     def get_limits(self) -> Optional[dict]:
@@ -524,13 +535,16 @@ class MDBListClient:
             payload["shows"] = shows
         return self._req("POST", f"/lists/{list_id}/items/remove", json=payload)
 
-    def search(self, query: str, media_type: str = "any") -> list[dict]:
+    def search(self, query: str, media_type: str = "any",
+               year: Optional[int] = None) -> list[dict]:
         """
         Search for media on MDBList.
-        API docs: GET /search/{media_type}?query=...
+        API docs: GET /search/{media_type}?query=...&year=...
         """
         type_slug = {"movie": "movie", "show": "show"}.get(media_type, "any")
         params = {"query": query}
+        if year:
+            params["year"] = year
         r = self._req("GET", f"/search/{type_slug}", params=params)
         if isinstance(r, dict) and "search" in r:
             return r["search"]
@@ -629,7 +643,7 @@ class TitleMatcher:
                     "_src": "FlixPatrol"}
 
         # --- Check cache ---
-        cache_key = f"match:v3:{title}:{year}:{media_type}"
+        cache_key = f"match:v4:{title}:{year}:{media_type}"
         cached = self.cache.get(cache_key)
         if cached is not None:
             return cached if cached != "_MISS_" else None
@@ -638,8 +652,14 @@ class TitleMatcher:
         best = None
 
         # --- Strategy 2: MDBList search (has IMDB IDs) ---
-        results = self.mdb.search(title, mtype)
-        best = self._pick(results, title, year, media_type)
+        # Try with year first for precision
+        if year:
+            results = self.mdb.search(title, mtype, year)
+            best = self._pick(results, title, year)
+        # Retry without year
+        if not best:
+            results = self.mdb.search(title, mtype)
+            best = self._pick(results, title, year)
         if best:
             best["_src"] = "MDBList"
 
@@ -647,10 +667,10 @@ class TitleMatcher:
         if not best and self.tmdb and self.tmdb.available:
             if year:
                 results = self.tmdb.search(title, mtype, year)
-                best = self._pick(results, title, year, media_type)
+                best = self._pick(results, title, year)
             if not best:
                 results = self.tmdb.search(title, mtype)
-                best = self._pick(results, title, year, media_type)
+                best = self._pick(results, title, year)
             if best:
                 best["_src"] = "TMDB"
 
@@ -660,37 +680,48 @@ class TitleMatcher:
             self.cache.set(cache_key, "_MISS_")
         return best
 
-    def _pick(self, results: list, title: str, year: Optional[int],
-              media_type: str) -> Optional[dict]:
-        """Pick the best match from search results. Only returns items with IDs."""
+    def _pick(self, results: list, title: str, year: Optional[int]) -> Optional[dict]:
+        """
+        Pick the best match from search results.
+        Strict matching: only returns items where title matches.
+        Year is used to disambiguate, not as a hard filter.
+        """
         if not results:
             return None
 
         tl = self._norm(title)
 
-        # Pass 1: exact title + year match
+        # Pass 1: exact title + exact year match (strongest)
+        if year:
+            for item in results:
+                it = self._norm(item.get("title", ""))
+                iy = item.get("year")
+                if it == tl and iy and iy == year:
+                    r = self._extract_ids(item)
+                    if r:
+                        return r
+
+        # Pass 2: exact title + year ±1 (for release date differences)
+        if year:
+            for item in results:
+                it = self._norm(item.get("title", ""))
+                iy = item.get("year")
+                if it == tl and iy and abs(iy - year) == 1:
+                    r = self._extract_ids(item)
+                    if r:
+                        return r
+
+        # Pass 3: exact title, no year info available on either side
         for item in results:
             it = self._norm(item.get("title", ""))
             iy = item.get("year")
-            if it == tl and self._year_ok(year, iy):
+            if it == tl and (year is None or iy is None):
                 r = self._extract_ids(item)
                 if r:
                     return r
 
-        # Pass 2: exact title, ignore year
-        for item in results:
-            it = self._norm(item.get("title", ""))
-            if it == tl:
-                r = self._extract_ids(item)
-                if r:
-                    return r
-
-        # Pass 3: first result with any ID
-        for item in results:
-            r = self._extract_ids(item)
-            if r:
-                return r
-
+        # NO Pass 4: we do NOT blindly take the first result.
+        # If the title doesn't match, we return None.
         return None
 
     @staticmethod
@@ -978,6 +1009,7 @@ def _match_all(fp_items: list, scraper: FlixPatrolScraper,
     for item in fp_items:
         title_info = scraper.get_title_info(item["url"]) if item.get("url") else {}
         media_type = item.get("type", "movie")
+        fp_year = title_info.get("year")
 
         ids = matcher.find(item["title"], title_info, media_type)
         if ids and (ids.get("imdb_id") or ids.get("tmdb_id")):
@@ -985,9 +1017,13 @@ def _match_all(fp_items: list, scraper: FlixPatrolScraper,
             matched.append(ids)
             id_str = ids.get("imdb_id") or f"tmdb:{ids.get('tmdb_id')}"
             src = ids.pop("_src", "unknown")
-            logger.info(f"  ✓ {item['title']} → {id_str} (via {src})")
+            matched_year = ids.get("year", "?")
+            logger.info(
+                f"  ✓ {item['title']} ({fp_year or '?'}) "
+                f"→ {id_str} ({matched_year}) via {src}"
+            )
         else:
-            logger.warning(f"  ✗ {item['title']} – not found")
+            logger.warning(f"  ✗ {item['title']} ({fp_year or '?'}) – not found")
         time.sleep(0.3)
     return matched
 
