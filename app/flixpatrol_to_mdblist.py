@@ -546,11 +546,14 @@ class MDBListClient:
         if year:
             params["year"] = year
         r = self._req("GET", f"/search/{type_slug}", params=params)
+        results = []
         if isinstance(r, dict) and "search" in r:
-            return r["search"]
-        if isinstance(r, list):
-            return r
-        return []
+            results = r["search"]
+        elif isinstance(r, list):
+            results = r
+        # Sort by score descending — most well-known first
+        results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -593,7 +596,7 @@ class TMDBClient:
             data = r.json()
             results = data.get("results", [])
             logger.debug(f"TMDB returned {len(results)} results for '{query}'")
-            # Normalize to our format
+            # Normalize to our format, include popularity for tiebreaking
             out = []
             for item in results:
                 title = item.get("title") or item.get("name", "")
@@ -607,7 +610,11 @@ class TMDBClient:
                     "type": media_type,
                     "tmdb_id": item.get("id"),
                     "ids": {"tmdb": item.get("id")},
+                    "popularity": item.get("popularity", 0),
+                    "vote_count": item.get("vote_count", 0),
                 })
+            # Sort by popularity descending — most well-known first
+            out.sort(key=lambda x: x.get("popularity", 0), reverse=True)
             return out
         except requests.RequestException as e:
             logger.error(f"TMDB search error for '{query}': {e}")
